@@ -17,6 +17,7 @@ class PaymentVerification(models.Model):
     currency = models.CharField(max_length=10, default='ETB')
     reference_verified = models.BooleanField(default=False)
     amount_verified = models.BooleanField(default=False)
+    receiver_verified = models.BooleanField(default=False)
     is_verified = models.BooleanField(default=False)
     status = models.CharField(max_length=50, null=True, blank=True)
     receipt_data = models.JSONField(null=True, blank=True)

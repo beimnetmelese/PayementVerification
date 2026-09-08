@@ -183,7 +183,7 @@ class CBEReceiptScraper:
         transaction_data = {
             "payer": clean_val(data.get("debitAccountHolder")),
             "payer_account": clean_val(data.get("debitAccountNo")),
-            "receiver": clean_val(data.get("creditAccountHolder")),
+            "receiver": clean_val(data.get("creditAccountHolder") or data.get("receiver") or data.get("creditAccountName") or data.get("receiverName") or data.get("beneficiaryName")),
             "receiver_account": clean_val(data.get("creditAccountNo")),
             "payment_type": clean_val(data.get("platformTransactionType") or data.get("transactionType")),
             "payment_date_time": date_time_val,
@@ -353,7 +353,7 @@ class CBEReceiptScraper:
         transaction_data = {
             "payer": clean_val(lookup(['payer'])),
             "payer_account": clean_val(lookup(['payer account', 'account'])),
-            "receiver": clean_val(lookup(['receiver'])),
+            "receiver": clean_val(lookup(['receiver', 'credit account holder', 'credited account holder', 'receiver name', 'recipient', 'beneficiary'])),
             "receiver_account": clean_val(lookup(['receiver account'])),
             "payment_type": clean_val(lookup(['payment type'])),
             "payment_date_time": clean_val(lookup(['payment date & time', 'payment date'])),
@@ -524,7 +524,7 @@ class TelebirrReceiptScraper:
         transaction_data = {
             "payer": clean_val(payer_raw),
             "payer_account": clean_val(lookup(['payer telebirr no.'])),
-            "receiver": clean_val(lookup(['credited party name']) or "Ethio telecom"),
+            "receiver": clean_val(lookup(['credited party name', 'credited party', 'receiver', 'receiver name', 'recipient', 'beneficiary'])),
             "receiver_account": clean_val(lookup(['credited party account no'])),
             "payment_type": clean_val(lookup(['payment mode']) or "telebirr"),
             "payment_date_time": clean_val(lookup(['payment date'])),

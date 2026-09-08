@@ -11,13 +11,37 @@ from payments.scraper import (
 logger = logging.getLogger(__name__)
 
 
+EXPECTED_RECEIVER_NAME = "Beimnet Melese Kebede"
+
+
+def is_receiver_verified(actual_receiver: str, expected_receiver: str = EXPECTED_RECEIVER_NAME) -> bool:
+    """
+    Check if the receipt's receiver / credited party name matches expected receiver name.
+    Ignores case, normalizes whitespace, and supports title prefixes or appended details.
+    """
+    if not actual_receiver:
+        return False
+    clean_actual = ' '.join(str(actual_receiver).split()).lower()
+    clean_expected = ' '.join(str(expected_receiver).split()).lower()
+
+    if clean_actual == clean_expected:
+        return True
+
+    # Token-based match: check if all expected name words exist in actual receiver string
+    expected_words = [w for w in clean_expected.split() if len(w) > 1]
+    if expected_words and all(word in clean_actual for word in expected_words):
+        return True
+
+    return False
+
+
 class PaymentVerificationService:
     """
     Business logic service for verifying payment receipts from CBE or Telebirr.
     Enforces One-Time Verification (duplicate payment prevention per bank provider):
-    - Registers receipt ONLY when verification succeeds (bank responds, receipt exists, amount & ref match).
+    - Registers receipt ONLY when verification succeeds (bank responds, receipt exists, amount & ref match, receiver matches).
     - Checks duplicate status per bank (cbe / telebirr).
-    - Accurately evaluates reference_verified and amount_verified. Returns reference_verified=False when receipt is not found.
+    - Accurately evaluates reference_verified, amount_verified, and receiver_verified.
     """
 
     def __init__(self, scraper=None):
@@ -30,7 +54,7 @@ class PaymentVerificationService:
 
     def verify_payment(self, reference_id: str, requested_amount: Decimal, bank: str = 'cbe') -> tuple[dict, int]:
         """
-        Verify payment reference ID and amount against external bank receipt (CBE or Telebirr).
+        Verify payment reference ID, amount, and receiver name against external bank receipt (CBE or Telebirr).
         Returns tuple of (response_dict, http_status_code).
         """
         bank_clean = (bank or 'cbe').lower().strip()
@@ -57,6 +81,14 @@ class PaymentVerificationService:
             if existing_successful_verification.verified_amount is not None:
                 amount_verified = (existing_successful_verification.verified_amount == requested_amount_dec)
 
+            verified_receiver = None
+            if existing_successful_verification.receipt_data:
+                tx_data = existing_successful_verification.receipt_data.get("transaction", {})
+                cust_data = existing_successful_verification.receipt_data.get("customer", {})
+                verified_receiver = tx_data.get("receiver") or tx_data.get("credited_party_name") or cust_data.get("customer_name")
+
+            receiver_verified = existing_successful_verification.receiver_verified or is_receiver_verified(verified_receiver)
+
             return {
                 "success": True,
                 "verified": False,
@@ -65,6 +97,9 @@ class PaymentVerificationService:
                 "reference_id": reference_id,
                 "reference_verified": True,
                 "amount_verified": amount_verified,
+                "receiver_verified": receiver_verified,
+                "expected_receiver": EXPECTED_RECEIVER_NAME,
+                "verified_receiver": verified_receiver,
                 "requested_amount": requested_amount_str,
                 "verified_amount": verified_amt_str,
                 "currency": existing_successful_verification.currency or "ETB",
@@ -86,6 +121,9 @@ class PaymentVerificationService:
                 "reference_id": reference_id,
                 "reference_verified": False,
                 "amount_verified": False,
+                "receiver_verified": False,
+                "expected_receiver": EXPECTED_RECEIVER_NAME,
+                "verified_receiver": None,
                 "message": f"Unable to find or retrieve the {bank_clean.upper()} receipt."
             }, 404
         except CBEScraperFetchException as err:
@@ -98,6 +136,9 @@ class PaymentVerificationService:
                 "reference_id": reference_id,
                 "reference_verified": False,
                 "amount_verified": False,
+                "receiver_verified": False,
+                "expected_receiver": EXPECTED_RECEIVER_NAME,
+                "verified_receiver": None,
                 "message": f"{bank_clean.upper()} receipt service is temporarily unavailable or unreachable."
             }, 502
         except CBEParseException as err:
@@ -110,6 +151,9 @@ class PaymentVerificationService:
                 "reference_id": reference_id,
                 "reference_verified": False,
                 "amount_verified": False,
+                "receiver_verified": False,
+                "expected_receiver": EXPECTED_RECEIVER_NAME,
+                "verified_receiver": None,
                 "message": f"Failed to parse receipt details from {bank_clean.upper()} website response."
             }, 502
         except Exception as err:
@@ -122,6 +166,9 @@ class PaymentVerificationService:
                 "reference_id": reference_id,
                 "reference_verified": False,
                 "amount_verified": False,
+                "receiver_verified": False,
+                "expected_receiver": EXPECTED_RECEIVER_NAME,
+                "verified_receiver": None,
                 "message": "An error occurred while verifying the payment."
             }, 500
 
@@ -145,6 +192,10 @@ class PaymentVerificationService:
         else:
             amount_verified = False
 
+        # Evaluate receiver/credited party name
+        actual_receiver_name = transaction_info.get("receiver")
+        receiver_verified = is_receiver_verified(actual_receiver_name)
+
         # Reference verification is True ONLY IF transaction details were actually retrieved from the bank
         has_transaction_details = (
             transferred_amount_str is not None or
@@ -152,7 +203,7 @@ class PaymentVerificationService:
             transaction_info.get("reference_no") is not None
         )
         reference_verified = has_transaction_details
-        is_verified = reference_verified and amount_verified
+        is_verified = reference_verified and amount_verified and receiver_verified
 
         # Step 3: ONLY register in DB when payment verification completely succeeds
         if is_verified:
@@ -165,6 +216,7 @@ class PaymentVerificationService:
                     currency=currency,
                     reference_verified=True,
                     amount_verified=True,
+                    receiver_verified=True,
                     is_verified=True,
                     status=receipt_data.get("status"),
                     receipt_data=receipt_data
@@ -180,6 +232,9 @@ class PaymentVerificationService:
                 "reference_id": reference_id,
                 "reference_verified": True,
                 "amount_verified": True,
+                "receiver_verified": True,
+                "expected_receiver": EXPECTED_RECEIVER_NAME,
+                "verified_receiver": actual_receiver_name,
                 "requested_amount": requested_amount_str,
                 "verified_amount": verified_amount_str,
                 "currency": currency,
@@ -187,12 +242,21 @@ class PaymentVerificationService:
             }, 200
 
         # Handle Mismatch cases (Always include receipt data when found so client can inspect details)
-        if not reference_verified and not amount_verified:
-            message = "Reference verification failed and payment amount does not match the receipt."
-        elif not amount_verified:
-            message = "Payment amount does not match the receipt."
+        mismatches = []
+        if not reference_verified:
+            mismatches.append("Reference verification failed")
+        if not amount_verified:
+            mismatches.append("payment amount does not match the receipt")
+        if not receiver_verified:
+            recipient_label = "Credited Party name" if bank_clean == 'telebirr' else "Receiver name"
+            mismatches.append(f"{recipient_label} does not match expected ('{EXPECTED_RECEIVER_NAME}')")
+
+        if len(mismatches) == 1:
+            message = f"{mismatches[0]}."
+            message = message[0].upper() + message[1:]
         else:
-            message = "Reference verification failed."
+            message = "; ".join(mismatches) + "."
+            message = message[0].upper() + message[1:]
 
         return {
             "success": True,
@@ -202,6 +266,9 @@ class PaymentVerificationService:
             "reference_id": reference_id,
             "reference_verified": reference_verified,
             "amount_verified": amount_verified,
+            "receiver_verified": receiver_verified,
+            "expected_receiver": EXPECTED_RECEIVER_NAME,
+            "verified_receiver": actual_receiver_name,
             "requested_amount": requested_amount_str,
             "verified_amount": verified_amount_str,
             "currency": currency,

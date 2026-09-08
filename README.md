@@ -12,7 +12,8 @@ The API dynamically visits the CBE receipt website at `https://mbreciept.cbe.com
 - **One-Time Verification & Duplicate Prevention**: A receipt reference can only be verified ONCE. Registrations ONLY occur when verification completely succeeds (`verified == true`). Failed attempts (e.g. bank down, wrong amount, not found) are NOT marked as used.
 - **Strict Amount Verification**: Matches requested amount against **Transferred Amount** (`transferred_amount`), avoiding service charges or total debited amounts.
 - **Monetary Precision**: Uses Python `Decimal` for currency precision.
-- **Detailed Verification Flags**: Returns distinct `reference_verified`, `amount_verified`, and `already_used` indicators.
+- **Receiver / Credited Party Verification**: Verifies receiver name on CBE receipts and credited party name on Telebirr receipts against target recipient `Beimnet Melese Kebede` (case-insensitive).
+- **Detailed Verification Flags**: Returns distinct `reference_verified`, `amount_verified`, `receiver_verified`, and `already_used` indicators.
 - **Robust Exception Handling**: Gracefully handles network timeouts, missing fields, non-existent references, and parsing edge cases without exposing internal stack traces.
 - **DRF Browsable API**: Fully interactive test UI accessible via web browser.
 - **Security & SSRF Prevention**: Restricts target domain strictly to `mbreciept.cbe.com.et` and sanitizes input reference IDs against path traversal.
@@ -118,9 +119,13 @@ curl -X POST http://127.0.0.1:8000/api/payments/verify/ \
     "success": true,
     "verified": true,
     "already_used": false,
+    "bank": "cbe",
     "reference_id": "v2-hfHCxGVTzbgxUAOvvyEt",
     "reference_verified": true,
     "amount_verified": true,
+    "receiver_verified": true,
+    "expected_receiver": "Beimnet Melese Kebede",
+    "verified_receiver": "Beimnet Melese Kebede",
     "requested_amount": "130.00",
     "verified_amount": "130.00",
     "currency": "ETB",
@@ -153,9 +158,9 @@ curl -X POST http://127.0.0.1:8000/api/payments/verify/ \
             "branch": null
         },
         "transaction": {
-            "payer": "Beimnet Melese Kebede",
+            "payer": "Abebe Bikila",
             "payer_account": "1****3718",
-            "receiver": "Fasika Addis Wubet",
+            "receiver": "Beimnet Melese Kebede",
             "receiver_account": "1****3937",
             "payment_type": "A2A",
             "payment_date_time": "20260908",

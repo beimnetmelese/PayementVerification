@@ -40,9 +40,9 @@ SAMPLE_CBE_RECEIPT_DATA = {
         "branch": None
     },
     "transaction": {
-        "payer": "Beimnet Melese Kebede",
+        "payer": "Abebe Bikila",
         "payer_account": "1****3718",
-        "receiver": "Fasika Addis Wubet",
+        "receiver": "Beimnet Melese Kebede",
         "receiver_account": "1****3937",
         "payment_type": "A2A",
         "payment_date_time": "Sep 8, 2026, 7:48 PM",
@@ -85,9 +85,9 @@ SAMPLE_TELEBIRR_RECEIPT_DATA = {
         "branch": None
     },
     "transaction": {
-        "payer": "Beimnet Melese Kebede",
+        "payer": "Abebe Bikila",
         "payer_account": "2519****9350",
-        "receiver": "Ethio telecom",
+        "receiver": "Beimnet Melese Kebede",
         "receiver_account": "111222",
         "payment_type": "telebirr",
         "payment_date_time": "09-09-2026 01:18:26",
@@ -118,7 +118,7 @@ class PaymentVerificationAPITests(APITestCase):
             "amount": 3.00
         }
 
-    # Test Case 1: Valid CBE reference + correct amount
+    # Test Case 1: Valid CBE reference + correct amount + matching receiver
     @patch.object(CBEReceiptScraper, 'scrape', return_value=SAMPLE_CBE_RECEIPT_DATA)
     def test_valid_cbe_verification(self, mock_scrape):
         response = self.client.post(self.url, self.valid_cbe_payload, format='json')
@@ -129,10 +129,15 @@ class PaymentVerificationAPITests(APITestCase):
         self.assertTrue(data['verified'])
         self.assertFalse(data['already_used'])
         self.assertEqual(data['bank'], 'cbe')
+        self.assertTrue(data['reference_verified'])
+        self.assertTrue(data['amount_verified'])
+        self.assertTrue(data['receiver_verified'])
+        self.assertEqual(data['expected_receiver'], "Beimnet Melese Kebede")
+        self.assertEqual(data['verified_receiver'], "Beimnet Melese Kebede")
         self.assertEqual(data['requested_amount'], "130.00")
         self.assertEqual(data['verified_amount'], "130.00")
 
-    # Test Case 2: Valid Telebirr reference + correct amount
+    # Test Case 2: Valid Telebirr reference + correct amount + matching credited party
     @patch.object(TelebirrReceiptScraper, 'scrape', return_value=SAMPLE_TELEBIRR_RECEIPT_DATA)
     def test_valid_telebirr_verification(self, mock_scrape):
         response = self.client.post(self.url, self.valid_telebirr_payload, format='json')
@@ -143,11 +148,14 @@ class PaymentVerificationAPITests(APITestCase):
         self.assertTrue(data['verified'])
         self.assertFalse(data['already_used'])
         self.assertEqual(data['bank'], 'telebirr')
+        self.assertTrue(data['reference_verified'])
+        self.assertTrue(data['amount_verified'])
+        self.assertTrue(data['receiver_verified'])
         self.assertEqual(data['requested_amount'], "3.00")
         self.assertEqual(data['verified_amount'], "3.00")
         self.assertEqual(data['receipt']['company']['name'], "Ethio telecom Share Company")
 
-    # Test Case 3: Telebirr amount mismatch (MUST INCLUDE RECEIPT DETAILS)
+    # Test Case 3: Telebirr amount mismatch
     @patch.object(TelebirrReceiptScraper, 'scrape', return_value=SAMPLE_TELEBIRR_RECEIPT_DATA)
     def test_telebirr_amount_mismatch(self, mock_scrape):
         payload = {
@@ -162,10 +170,77 @@ class PaymentVerificationAPITests(APITestCase):
         self.assertTrue(data['success'])
         self.assertFalse(data['verified'])
         self.assertFalse(data['amount_verified'])
+        self.assertTrue(data['receiver_verified'])
         self.assertEqual(data['verified_amount'], "3.00")
         self.assertIn("receipt", data)
 
-    # Test Case 4: Separate Bank Duplicate Protection (Same ref ID for telebirr vs cbe)
+    # Test Case 4: CBE Receiver Name Mismatch
+    @patch.object(CBEReceiptScraper, 'scrape')
+    def test_cbe_receiver_name_mismatch(self, mock_scrape):
+        wrong_receiver_data = {
+            **SAMPLE_CBE_RECEIPT_DATA,
+            "transaction": {
+                **SAMPLE_CBE_RECEIPT_DATA["transaction"],
+                "receiver": "Fasika Addis Wubet"
+            }
+        }
+        mock_scrape.return_value = wrong_receiver_data
+
+        response = self.client.post(self.url, self.valid_cbe_payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+
+        self.assertTrue(data['success'])
+        self.assertFalse(data['verified'])
+        self.assertTrue(data['reference_verified'])
+        self.assertTrue(data['amount_verified'])
+        self.assertFalse(data['receiver_verified'])
+        self.assertIn("Receiver name does not match expected", data['message'])
+
+    # Test Case 5: Telebirr Credited Party Name Mismatch
+    @patch.object(TelebirrReceiptScraper, 'scrape')
+    def test_telebirr_credited_party_mismatch(self, mock_scrape):
+        wrong_receiver_data = {
+            **SAMPLE_TELEBIRR_RECEIPT_DATA,
+            "transaction": {
+                **SAMPLE_TELEBIRR_RECEIPT_DATA["transaction"],
+                "receiver": "Ethio telecom"
+            }
+        }
+        mock_scrape.return_value = wrong_receiver_data
+
+        response = self.client.post(self.url, self.valid_telebirr_payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+
+        self.assertTrue(data['success'])
+        self.assertFalse(data['verified'])
+        self.assertTrue(data['reference_verified'])
+        self.assertTrue(data['amount_verified'])
+        self.assertFalse(data['receiver_verified'])
+        self.assertIn("Credited Party name does not match expected", data['message'])
+
+    # Test Case 6: Case-Insensitive Receiver Name Matching
+    @patch.object(CBEReceiptScraper, 'scrape')
+    def test_case_insensitive_receiver_matching(self, mock_scrape):
+        case_var_data = {
+            **SAMPLE_CBE_RECEIPT_DATA,
+            "transaction": {
+                **SAMPLE_CBE_RECEIPT_DATA["transaction"],
+                "receiver": "BEIMNET melese KEBEDE"
+            }
+        }
+        mock_scrape.return_value = case_var_data
+
+        response = self.client.post(self.url, self.valid_cbe_payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+
+        self.assertTrue(data['success'])
+        self.assertTrue(data['verified'])
+        self.assertTrue(data['receiver_verified'])
+
+    # Test Case 7: Separate Bank Duplicate Protection
     @patch.object(CBEReceiptScraper, 'scrape', return_value=SAMPLE_CBE_RECEIPT_DATA)
     @patch.object(TelebirrReceiptScraper, 'scrape', return_value=SAMPLE_TELEBIRR_RECEIPT_DATA)
     def test_per_bank_duplicate_separation(self, mock_telebirr_scrape, mock_cbe_scrape):
@@ -185,7 +260,7 @@ class PaymentVerificationAPITests(APITestCase):
         res_cbe2 = self.client.post(self.url, cbe_req, format='json')
         self.assertTrue(res_cbe2.json()['already_used'])
 
-    # Test Case 5: Missing or Invalid Bank Parameter Validation
+    # Test Case 8: Missing or Invalid Bank Parameter Validation
     def test_invalid_bank_parameter(self):
         payload = {"bank": "invalid_bank", "reference_id": "REF123", "amount": 100.00}
         response = self.client.post(self.url, payload, format='json')
