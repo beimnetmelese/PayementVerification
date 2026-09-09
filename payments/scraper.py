@@ -78,38 +78,33 @@ def extract_currency(val_str):
 
 class CBEReceiptScraper:
     """
-    Scraper service for retrieving and parsing CBE receipts from https://mbreciept.cbe.com.et/{reference_id}.
+    Direct REST API client service for retrieving and parsing CBE receipt details from
+    https://mb.cbe.com.et/api/v1/transactions/public/transaction-detail/{reference_id}.
     """
 
     def __init__(self, timeout=15):
         self.timeout = timeout
 
-    def build_url(self, reference_id: str) -> str:
-        """Construct target receipt URL."""
+    def build_api_url(self, reference_id: str) -> str:
+        """Construct target API URL."""
         clean_ref = reference_id.strip()
-        return f"{CBE_BASE_URL}/{clean_ref}"
+        return f"{CBE_API_BASE}/{clean_ref}"
 
     def scrape(self, reference_id: str) -> dict:
+        """
+        Fetch transaction detail directly from CBE Public API and parse response.
+        Raises CBEReceiptNotFoundException if receipt is missing or not found.
+        Raises CBEScraperFetchException if network or server error occurs.
+        """
         clean_ref = reference_id.strip()
-
-        # Strategy 1: Direct CBE Public JSON REST API
-        try:
-            api_data = self._fetch_via_cbe_api(clean_ref)
-            if api_data:
-                return self._parse_api_response(api_data, clean_ref)
-        except CBEReceiptNotFoundException:
-            raise
-        except Exception as api_err:
-            logger.info(f"Direct API strategy failed/fallback for {clean_ref}: {api_err}")
-
-        # Strategy 2: HTML Page fetch / rendering
-        html_content = self.fetch_receipt_html(clean_ref)
-        return self.parse_receipt(html_content, clean_ref)
+        api_data = self._fetch_via_cbe_api(clean_ref)
+        return self._parse_api_response(api_data, clean_ref)
 
     def _fetch_via_cbe_api(self, reference_id: str) -> dict:
-        api_url = f"{CBE_API_BASE}/{reference_id}"
+        api_url = self.build_api_url(reference_id)
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
             "Referer": "https://mbreciept.cbe.com.et/",
             "Origin": "https://mbreciept.cbe.com.et",
             "x-app-id": "d1292e42-7400-49de-a2d3-9731caa4c819",
@@ -120,20 +115,31 @@ class CBEReceiptScraper:
             if response.status_code in [404, 400]:
                 raise CBEReceiptNotFoundException(f"Receipt '{reference_id}' not found on CBE server.")
             if response.status_code == 200:
-                data = response.json()
+                try:
+                    data = response.json()
+                except Exception as json_err:
+                    raise CBEParseException(f"Invalid JSON response from CBE server: {json_err}")
+
                 if isinstance(data, dict):
                     if data.get("error") in ["Not Found", "Bad Request"] or data.get("status") in [404, 400]:
                         raise CBEReceiptNotFoundException(f"Receipt '{reference_id}' not found.")
                     if "debitAmount" in data or "amountCredited" in data or "id" in data:
                         return data
-        except CBEReceiptNotFoundException:
+                raise CBEReceiptNotFoundException(f"Receipt '{reference_id}' data incomplete or not found.")
+            
+            raise CBEScraperFetchException(f"CBE server returned HTTP status code {response.status_code}.")
+        except (CBEReceiptNotFoundException, CBEScraperFetchException, CBEParseException):
             raise
+        except requests.RequestException as req_err:
+            logger.error(f"Network error while connecting to CBE API for '{reference_id}': {req_err}")
+            raise CBEScraperFetchException(f"Unable to reach CBE API server: {req_err}")
         except Exception as err:
-            logger.warning(f"CBE Direct API call error: {err}")
-        return None
+            logger.error(f"Unexpected error calling CBE API for '{reference_id}': {err}")
+            raise CBEScraperFetchException(f"Unexpected error during CBE API call: {err}")
 
     def _parse_api_response(self, data: dict, reference_id: str) -> dict:
         status_val = clean_val(data.get("status")) or "COMPLETED"
+        ref_id = clean_val(data.get("id")) or reference_id
 
         company_data = {
             "name": "Commercial Bank of Ethiopia",
@@ -146,7 +152,7 @@ class CBEReceiptScraper:
             "telephone": "+251-551-50-04",
             "fax": "+251-551-45-22",
             "tin": "0000006966",
-            "vat_receipt_no": clean_val(data.get("id")) or reference_id,
+            "vat_receipt_no": ref_id,
             "vat_registration_no": "011140",
             "vat_registration_date": "01/01/2003",
         }
@@ -164,30 +170,44 @@ class CBEReceiptScraper:
         }
 
         transferred_amt = extract_decimal(data.get("amountCredited") or data.get("debitAmount"))
-        total_debited = extract_decimal(data.get("amountDebited"))
-        service_charge = extract_decimal(data.get("serviceChargeValue"))
-        vat = extract_decimal(data.get("vatValue"))
+        total_debited = extract_decimal(data.get("amountDebited") or data.get("amountDebitedWithCurrency"))
+        service_charge = extract_decimal(data.get("serviceChargeValue") or data.get("totalChargeAmount"))
+        vat = extract_decimal(data.get("vatValue") or data.get("totalTaxAmount"))
         disaster_fund = extract_decimal(data.get("drCharge"))
-        currency = extract_currency(data.get("debitCurrency") or data.get("creditCurrency") or "ETB")
+        currency = extract_currency(data.get("creditCurrency") or data.get("debitCurrency") or "ETB")
 
-        date_time_val = clean_val(
-            data.get("authDate") or
-            (data.get("dateTimes", [None])[0] if data.get("dateTimes") else None)
+        # Extract date/time from dateTimes list or authDate / processingDate
+        date_times_list = data.get("dateTimes")
+        date_time_val = None
+        if isinstance(date_times_list, list) and len(date_times_list) > 0 and date_times_list[0]:
+            date_time_val = clean_val(date_times_list[0])
+        if not date_time_val:
+            date_time_val = clean_val(data.get("authDate") or data.get("processingDate"))
+
+        # Extract payment reason / description
+        payment_details = data.get("paymentDetails")
+        reason_val = clean_val(data.get("description"))
+        if not reason_val and isinstance(payment_details, list) and len(payment_details) > 0:
+            reason_val = clean_val(payment_details[0])
+
+        receiver_val = clean_val(
+            data.get("creditAccountHolder") or
+            data.get("receiver") or
+            data.get("creditAccountName") or
+            data.get("receiverName") or
+            data.get("beneficiaryName")
         )
 
-        reason_val = clean_val(
-            data.get("description") or
-            (data.get("paymentDetails", [None])[0] if data.get("paymentDetails") else None)
-        )
+        payer_val = clean_val(data.get("debitAccountHolder") or data.get("payer"))
 
         transaction_data = {
-            "payer": clean_val(data.get("debitAccountHolder")),
+            "payer": payer_val,
             "payer_account": clean_val(data.get("debitAccountNo")),
-            "receiver": clean_val(data.get("creditAccountHolder") or data.get("receiver") or data.get("creditAccountName") or data.get("receiverName") or data.get("beneficiaryName")),
+            "receiver": receiver_val,
             "receiver_account": clean_val(data.get("creditAccountNo")),
             "payment_type": clean_val(data.get("platformTransactionType") or data.get("transactionType")),
             "payment_date_time": date_time_val,
-            "reference_no": clean_val(data.get("id")) or reference_id,
+            "reference_no": ref_id,
             "reason": reason_val,
             "transferred_amount": transferred_amt,
             "service_charge": service_charge,
@@ -195,176 +215,6 @@ class CBEReceiptScraper:
             "disaster_risk_response_fund": disaster_fund,
             "total_amount_debited": total_debited,
             "currency": currency,
-        }
-
-        return {
-            "status": status_val,
-            "company": company_data,
-            "customer": customer_data,
-            "transaction": transaction_data,
-        }
-
-    def fetch_receipt_html(self, reference_id: str) -> str:
-        target_url = self.build_url(reference_id)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-
-        try:
-            response = requests.get(target_url, headers=headers, timeout=self.timeout, verify=False)
-            if response.status_code == 404:
-                raise CBEReceiptNotFoundException(f"Receipt with reference '{reference_id}' was not found (HTTP 404).")
-            
-            if response.status_code == 200:
-                html = response.text
-                if "Transferred Amount" in html or "Commercial Bank of Ethiopia" in html:
-                    return html
-        except CBEReceiptNotFoundException:
-            raise
-        except Exception as err:
-            logger.warning(f"Direct requests fetch failed for {target_url}: {err}")
-
-        return self._fetch_with_playwright(reference_id)
-
-    def _fetch_with_playwright(self, reference_id: str) -> str:
-        target_url = self.build_url(reference_id)
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    ignore_https_errors=True
-                )
-                page = context.new_page()
-                try:
-                    res = page.goto(target_url, timeout=self.timeout * 1000, wait_until="networkidle")
-                    if res and res.status in [404, 400]:
-                        raise CBEReceiptNotFoundException(f"Receipt '{reference_id}' not found (HTTP {res.status}).")
-
-                    try:
-                        page.wait_for_selector("text=Transferred Amount", timeout=8000)
-                    except Exception:
-                        pass
-
-                    content = page.content()
-                    if "502 Bad Gateway" in content or "503 Service" in content:
-                        raise CBEScraperFetchException("CBE website server returned 502 Bad Gateway / Service Unavailable.")
-
-                    if "404" in page.title() or "Receipt Not Found" in content or "Invalid Reference" in content:
-                        raise CBEReceiptNotFoundException(f"Receipt '{reference_id}' not found.")
-
-                    return content
-                finally:
-                    browser.close()
-        except CBEReceiptNotFoundException:
-            raise
-        except CBEScraperFetchException:
-            raise
-        except Exception as e:
-            logger.error(f"Playwright fetch failed: {e}")
-            raise CBEScraperFetchException(f"Unable to retrieve receipt from CBE server: {str(e)}")
-
-    def parse_receipt(self, html_content: str, reference_id: str) -> dict:
-        return self.parse_html_receipt(html_content, reference_id)
-
-    def parse_html_receipt(self, html_content: str, reference_id: str) -> dict:
-        if not html_content or len(html_content.strip()) == 0:
-            raise CBEParseException("Received empty HTML content from CBE receipt server.")
-
-        soup = BeautifulSoup(html_content, 'html.parser')
-        page_text = soup.get_text(separator="\n")
-
-        if "502 Bad Gateway" in page_text or "503 Service" in page_text:
-            raise CBEScraperFetchException("CBE server returned Bad Gateway or Service Unavailable.")
-
-        if "Receipt Not Found" in page_text or "Invalid Reference" in page_text or "404" in page_text:
-            raise CBEReceiptNotFoundException(f"Receipt '{reference_id}' was not found on CBE website.")
-
-        lines = [line.strip() for line in page_text.splitlines() if line.strip()]
-        kv_pairs = {}
-
-        for row in soup.find_all('tr'):
-            cols = row.find_all(['td', 'th'])
-            if len(cols) >= 2:
-                k = cols[0].get_text().strip().rstrip(':').lower()
-                v = cols[1].get_text().strip()
-                if k:
-                    kv_pairs[k] = v
-
-        for i in range(len(lines)):
-            line = lines[i]
-            if ':' in line:
-                parts = line.split(':', 1)
-                k = parts[0].strip().lower()
-                v = parts[1].strip()
-                if v:
-                    kv_pairs[k] = v
-                elif i + 1 < len(lines):
-                    next_val = lines[i+1].strip()
-                    if not next_val.endswith(':'):
-                        kv_pairs[k] = next_val
-
-        def lookup(possible_keys, default=None):
-            for key in possible_keys:
-                key_lower = key.lower()
-                for k, v in kv_pairs.items():
-                    if key_lower in k:
-                        return v
-            return default
-
-        transferred_amt_raw = lookup(['transferred amount', 'transferred_amount', 'transfer amount'])
-
-        # If essential transaction fields or transferred amount are completely missing, the receipt does not exist
-        if not transferred_amt_raw and not lookup(['payer', 'receiver', 'reference no']):
-            raise CBEReceiptNotFoundException(f"Receipt '{reference_id}' was not found on CBE website.")
-
-        status_val = clean_val(lookup(['status'])) or 'COMPLETED'
-
-        company_data = {
-            "name": clean_val(lookup(['company name', 'commercial bank']) or "Commercial Bank of Ethiopia"),
-            "country": clean_val(lookup(['country']) or "Ethiopia"),
-            "city": clean_val(lookup(['city'])),
-            "address": clean_val(lookup(['address'])),
-            "postal_code": clean_val(lookup(['postal code', 'postal'])),
-            "swift_code": clean_val(lookup(['swift code', 'swift'])),
-            "email": clean_val(lookup(['email'])),
-            "telephone": clean_val(lookup(['tel', 'telephone', 'phone'])),
-            "fax": clean_val(lookup(['fax'])),
-            "tin": clean_val(lookup(['tin (tax id)', 'tin'])),
-            "vat_receipt_no": clean_val(lookup(['vat receipt no', 'vat receipt'])),
-            "vat_registration_no": clean_val(lookup(['vat registration no'])),
-            "vat_registration_date": clean_val(lookup(['vat registration date'])),
-        }
-
-        customer_data = {
-            "customer_name": clean_val(lookup(['customer name'])),
-            "region": clean_val(lookup(['region'])),
-            "city": clean_val(lookup(['customer city'])),
-            "sub_city": clean_val(lookup(['sub city'])),
-            "wereda_kebele": clean_val(lookup(['wereda/kebele', 'wereda', 'kebele'])),
-            "vat_registration_no": clean_val(lookup(['customer vat registration no'])),
-            "vat_registration_date": clean_val(lookup(['customer vat registration date'])),
-            "tin": clean_val(lookup(['customer tin'])),
-            "branch": clean_val(lookup(['branch'])),
-        }
-
-        transaction_data = {
-            "payer": clean_val(lookup(['payer'])),
-            "payer_account": clean_val(lookup(['payer account', 'account'])),
-            "receiver": clean_val(lookup(['receiver', 'credit account holder', 'credited account holder', 'receiver name', 'recipient', 'beneficiary'])),
-            "receiver_account": clean_val(lookup(['receiver account'])),
-            "payment_type": clean_val(lookup(['payment type'])),
-            "payment_date_time": clean_val(lookup(['payment date & time', 'payment date'])),
-            "reference_no": clean_val(lookup(['reference no', 'vat invoice no'])) or reference_id,
-            "reason": clean_val(lookup(['reason / type of service', 'reason'])),
-            "transferred_amount": extract_decimal(transferred_amt_raw),
-            "service_charge": extract_decimal(lookup(['service charge'])),
-            "vat": extract_decimal(lookup(['vat'])),
-            "disaster_risk_response_fund": extract_decimal(lookup(['disaster risk response fund', 'disaster risk'])),
-            "total_amount_debited": extract_decimal(lookup(['total amount debited'])),
-            "currency": extract_currency(transferred_amt_raw or 'ETB'),
         }
 
         return {

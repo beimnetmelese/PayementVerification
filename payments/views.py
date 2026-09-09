@@ -35,8 +35,14 @@ class VerifyPaymentView(APIView):
         bank = serializer.validated_data.get('bank', 'cbe')
         reference_id = serializer.validated_data['reference_id']
         amount = serializer.validated_data['amount']
+        expected_account = serializer.validated_data.get('expected_receiver_account')
 
         service = PaymentVerificationService()
-        result_data, http_status = service.verify_payment(reference_id, amount, bank=bank)
+        result_data, http_status = service.verify_payment(
+            reference_id,
+            amount,
+            bank=bank,
+            expected_receiver_account=expected_account
+        )
 
         return Response(result_data, status=http_status)

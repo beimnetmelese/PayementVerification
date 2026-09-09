@@ -31,6 +31,13 @@ class PaymentVerificationRequestSerializer(serializers.Serializer):
         min_value=Decimal('0.01'),
         help_text="The expected payment amount in ETB"
     )
+    expected_receiver_account = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=100,
+        help_text="Optional override for expected receiver account (e.g. 1********3718 or 2519****4233)"
+    )
 
     def validate_bank(self, value):
         if not value:
